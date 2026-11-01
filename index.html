@@ -197,6 +197,8 @@
   <button id="btnUndo" title="Letzte Änderung rückgängig">↶</button>
   <span id="who" title="Angemeldetes Konto"></span>
   <span class="grow"></span>
+  <button id="btnHouse" title="Haushalt & Schlüssel">🔑</button>
+  <button id="btnLock" title="App sperren (Passphrase wieder nötig)" style="display:none">🔒</button>
   <button id="btnShifts">Zeiten</button>
   <button id="btnExport">Export</button>
   <button id="btnImport">Import</button>
@@ -1959,6 +1961,7 @@
 (() => {
   const RELAYS = ["wss://nos.lol", "wss://relay.primal.net", "wss://offchain.pub"];
   const K_ID = "dn.id", K_HH = "dn.hh", K_ROLE = "dn.role", K_PEER = "dn.peer", K_CACHE = "dn.cache.";
+  const K_KEEP = "dn.keep", KEEP_TAGE = 7;
   const b64 = (u8) => btoa(String.fromCharCode(...u8));
   const ub64 = (s) => Uint8Array.from(atob(s), c => c.charCodeAt(0));
   const hex = (u8) => [...u8].map(b => b.toString(16).padStart(2, "0")).join("");
@@ -2299,8 +2302,8 @@
     return location.origin + location.pathname + "#join=" + encodeURIComponent(key);
   }
 
-  function zeigeQR(key) {
-    const box = $("qrBox");
+  function zeigeQR(key, boxId) {
+    const box = $(boxId || "qrBox");
     if (!box) return;
     try {
       const QR = (window.QRCode && (window.QRCode.default || window.QRCode));
@@ -2322,6 +2325,26 @@
     S.hh = ub64(hhB64);
     S.role = localStorage.getItem(K_ROLE) || "owner";
     S.peer = localStorage.getItem(K_PEER) || null;
+  }
+
+  function merkeAngemeldet() {
+    try {
+      localStorage.setItem(K_KEEP, JSON.stringify({
+        secret: hex(S.id.secret), hh: b64(S.hh), role: S.role, peer: S.peer,
+        until: Date.now() + KEEP_TAGE * 864e5
+      }));
+    } catch (e) {}
+  }
+  function sperre() { localStorage.removeItem(K_KEEP); }
+  function ausMerkung() {
+    try {
+      const k = JSON.parse(localStorage.getItem(K_KEEP) || "null");
+      if (!k || !k.secret || !k.until || k.until < Date.now()) { if (k) localStorage.removeItem(K_KEEP); return false; }
+      const secret = unhex(k.secret);
+      S.id = { secret, pub: Nostr.getPublicKey(secret) };
+      S.hh = ub64(k.hh); S.role = k.role; S.peer = k.peer || null;
+      return true;
+    } catch (e) { return false; }
   }
 
   async function createHousehold(pass) {
@@ -2364,9 +2387,88 @@
 
   window.__nostr = { S, RELAYS, startLive, subscribe, handleEvent, publish, fetchMonth, publishHousehold: () => `${b64(S.hh)}.${S.id.pub}` };
 
-  function boot() {
-    try {
+  function zeigeSperre() {
+    const lk = document.getElementById("btnLock");
+    if (lk) lk.style.display = "";
+  }
 
+  function boot() {
+    // Knöpfe immer verdrahten – unabhängig davon, welcher Schritt zu sehen ist
+    $("btnNew").addEventListener("click", () => step("gateNew"));
+    $("btnJoin").addEventListener("click", () => step("gateJoinForm"));
+    $("pass").addEventListener("keydown", e => { if (e.key === "Enter") $("btnUnlock").click(); });
+
+    $("btnCreate").addEventListener("click", async () => {
+      const p1 = $("passNew").value, p2 = $("passNew2").value;
+      if (p1.length < 8) return $("gateErr2").textContent = "Mindestens 8 Zeichen.";
+      if (p1 !== p2) return $("gateErr2").textContent = "Passphrasen stimmen nicht überein.";
+      $("gateErr2").textContent = "";
+      try { await createHousehold(p1); if ($("keep").checked) merkeAngemeldet(); zeigeSperre(); } catch (e) { $("gateErr2").textContent = e.message; }
+    });
+
+    $("btnJoinGo").addEventListener("click", async () => {
+      $("gateErr3").textContent = "";
+      try {
+        if ($("joinPass").value.length < 8) throw new Error("Passphrase zu kurz (min. 8 Zeichen)");
+        if (!$("joinKey").value.trim()) throw new Error("Schlüssel fehlt");
+        await joinHousehold($("joinKey").value, $("joinPass").value);
+        if ($("keep").checked) merkeAngemeldet();
+        zeigeSperre();
+      } catch (e) { $("gateErr3").textContent = e.message || String(e); }
+    });
+
+    $("btnUnlock").addEventListener("click", async () => {
+      try {
+        await unlock($("pass").value);
+        if ($("keep").checked) merkeAngemeldet(); else sperre();
+        gate(false); zeigeSperre(); startLive();
+      } catch { $("gateErr").textContent = "Passphrase falsch."; }
+    });
+
+    $("btnDone").addEventListener("click", () => { gate(false); zeigeSperre(); startLive(); });
+
+    $("btnLogout").addEventListener("click", () => {
+      if (!confirm("Schlüssel auf diesem Gerät löschen? Ohne Sicherung ist der Zugang weg.")) return;
+      [K_ID, K_HH, K_ROLE, K_PEER, K_KEEP].forEach(k => localStorage.removeItem(k));
+      location.reload();
+    });
+
+    // Haushalt & Schlüssel
+    const dlgHouse = document.getElementById("dlgHouse");
+    const hausKey = () => `${b64(S.hh)}.${S.role === "owner" ? S.id.pub : S.peer}`;
+    document.getElementById("btnHouse").addEventListener("click", () => {
+      const key = hausKey();
+      $("hKey").value = key;
+      $("hQr").dataset.key = key;
+      $("hQr").innerHTML = "";
+      $("hRole").textContent = S.role === "owner"
+        ? "Rolle: Planer – du setzt den Plan, Wünsche kommen von ihr."
+        : "Rolle: Wünsche – du trägst Wünsche ein, den Plan setzt der Planer.";
+      dlgHouse.showModal();
+    });
+    document.getElementById("hClose").addEventListener("click", () => dlgHouse.close());
+    document.getElementById("hShowQr").addEventListener("click", () => {
+      zeigeQR($("hQr").dataset.key, "hQr");
+    });
+    document.getElementById("hCopy").addEventListener("click", async () => {
+      const key = $("hKey").value;
+      try { await navigator.clipboard.writeText(key); }
+      catch (e) { $("hKey").select(); try { document.execCommand("copy"); } catch (_) {} }
+      $("hCopy").textContent = "kopiert ✓";
+      setTimeout(() => { $("hCopy").textContent = "Schlüssel kopieren"; }, 1800);
+    });
+
+    const lock = document.getElementById("btnLock");
+    if (lock) lock.addEventListener("click", () => {
+      sperre();                       // Merkung weg – Passphrase wieder nötig
+      location.reload();
+    });
+
+    // Tor-Zustand bestimmen
+    try {
+      if (hasIdentity() && ausMerkung()) {      // still angemeldet (7 Tage)
+        gate(false); zeigeSperre(); startLive(); return;
+      }
       const hashJoin = (location.hash.match(/join=([^&]+)/) || [])[1];
       if (!hasIdentity()) {
         gate(true);
@@ -2378,40 +2480,6 @@
       } else { gate(true); step("gateUnlock"); }
       if (hashJoin) { try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {} }
     } catch (e) { console.error("gate:", e); }
-
-    $("btnNew").addEventListener("click", () => step("gateNew"));
-    $("btnJoin").addEventListener("click", () => step("gateJoinForm"));
-    $("pass").addEventListener("keydown", e => { if (e.key === "Enter") $("btnUnlock").click(); });
-
-    $("btnCreate").addEventListener("click", async () => {
-      const p1 = $("passNew").value, p2 = $("passNew2").value;
-      if (p1.length < 8) return $("gateErr2").textContent = "Mindestens 8 Zeichen.";
-      if (p1 !== p2) return $("gateErr2").textContent = "Passphrasen stimmen nicht überein.";
-      $("gateErr2").textContent = "";
-      try { await createHousehold(p1); } catch (e) { $("gateErr2").textContent = e.message; }
-    });
-
-    $("btnJoinGo").addEventListener("click", async () => {
-      $("gateErr3").textContent = "";
-      try {
-        if ($("joinPass").value.length < 8) throw new Error("Passphrase zu kurz (min. 8 Zeichen)");
-        if (!$("joinKey").value.trim()) throw new Error("Schlüssel fehlt");
-        await joinHousehold($("joinKey").value, $("joinPass").value);
-      } catch (e) { $("gateErr3").textContent = e.message || String(e); }
-    });
-
-    $("btnUnlock").addEventListener("click", async () => {
-      try { await unlock($("pass").value); gate(false); startLive(); }
-      catch { $("gateErr").textContent = "Passphrase falsch."; }
-    });
-
-    $("btnDone").addEventListener("click", () => { gate(false); startLive(); });
-
-    $("btnLogout").addEventListener("click", () => {
-      if (!confirm("Schlüssel auf diesem Gerät löschen? Ohne Sicherung ist der Zugang weg.")) return;
-      [K_ID, K_HH, K_ROLE, K_PEER].forEach(k => localStorage.removeItem(k));
-      location.reload();
-    });
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
@@ -2603,7 +2671,7 @@ function renderStatus(){
   const who = document.getElementById("who");
   const rolle = SYNC.role === "owner" ? "Planer" : SYNC.role === "partner" ? "Wünsche" : "";
   if(who){
-    who.textContent = SYNC.me ? `${SYNC.me.split("@")[0]} · ${rolle}` : "";
+    who.textContent = SYNC.me ? `${SYNC.me.slice(0, 8)}… · ${rolle}` : "";
     who.title = SYNC.me ? `Angemeldet als ${SYNC.me} (${rolle})` : "";
   }
   let text = "";
@@ -3117,6 +3185,10 @@ loadMonthFromServer();
       <input id="pass" type="password" autocomplete="current-password"
              style="width:100%;margin:6px 0 10px;padding:9px;background:#1e222b;color:#e8eaf0;
                     border:1px solid #2a2f3a;border-radius:9px;font:inherit">
+      <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:#98a1b0;margin:0 0 10px">
+        <input id="keep" type="checkbox" checked style="width:16px;height:16px">
+        Auf diesem Gerät angemeldet bleiben (7 Tage)
+      </label>
       <button id="btnUnlock" class="wide">Entsperren</button>
       <p id="gateErr" style="color:#e0574c;font-size:12.5px;margin-top:8px;min-height:16px"></p>
     </div>
@@ -3156,5 +3228,26 @@ loadMonthFromServer();
   </div>
 </div>
 
+
+<dialog id="dlgHouse" style="max-width:460px">
+  <div class="dlg-head">Haushalt &amp; Schlüssel <button id="hClose">×</button></div>
+  <div class="row" style="margin-bottom:6px"><span class="hint" style="margin:0" id="hRole"></span></div>
+  <p class="hint" style="margin:0 0 8px">Mit diesem Schlüssel kommt ein <b>weiteres Gerät</b> in euren Haushalt –
+     zum Beispiel ein neues Handy, oder wenn das alte den Schlüssel verloren hat. Er enthält nur den
+     gemeinsamen Haushalts-Schlüssel, keine Daten und kein Passwort.</p>
+  <div id="hQr" style="background:#fff;padding:10px;border-radius:12px;margin:0 0 10px;display:flex;justify-content:center"></div>
+  <textarea id="hKey" rows="3" readonly style="width:100%;padding:9px;background:#1e222b;color:#e8eaf0;
+     border:1px solid #2a2f3a;border-radius:9px;font:12px monospace"></textarea>
+  <div class="row" style="margin-top:8px">
+    <button id="hCopy" class="wide">Schlüssel kopieren</button>
+    <button id="hShowQr">QR zeigen</button>
+  </div>
+  <p class="hint" style="margin:10px 0 0"><b>Was er nicht kann:</b> Er entsperrt die App nicht –
+     jedes Gerät braucht zusätzlich seine <i>eigene</i> Passphrase. <b>Was du beachten solltest:</b>
+     Wer den Schlüssel hat, kann die verschlüsselten Pläne mitlesen, sobald er ein eigenes Passwort setzt.
+     Gib ihn deshalb nur persönlich weiter, nicht per Chat an Dritte.</p>
+  <p class="hint" style="margin:8px 0 0">Geht der Schlüssel auf <i>beiden</i> Geräten verloren, hilft nur ein
+     neuer Haushalt – die alten Pläne bleiben dann unlesbar.</p>
+</dialog>
 </body>
 </html>
